@@ -1,0 +1,406 @@
+---
+title: "Forecasting School Attendance"
+author: "James Beeson"
+format: 
+  html:
+    theme: cerulean
+    code-fold: true
+    embed-resources: true
+execute: 
+  warning: false
+---
+
+
+
+# Summary
+
+It is rare to find daily school level data as polished as the City of New York's K-12 attendance data. Still, pulling out insights from this data is not as simple as plotting attendance over time, which is initially a beautiful mess. In this analysis, I walk through the process of pulling out the following insights:
+
+- School attendance varies consistently by season. The highest attendance is at the start of the school year (August, September) and lowest at the end, which a saddle dip in the middle (around Christmas/New Years). 
+- The highest impact event on New York school attendance in recent history was the 2014 cold wave that hit the North Eastern US severely, causing school closures and students choosing to stay home.
+- Aside from seasonal variation, events that cause attendance to fluctuate are random.
+
+The last point is of particular interest. It implies that there is no large scale trend over time in school attendance. Change in attendance one year does not effect attendance the next year or hardly the next month. Later in the analysis, I cover what "random" looks like in our case and what we can do with that knowledge.
+
+```{r}
+#| warning: false
+
+pacman::p_load(
+  tidyverse,
+  tsibble,
+  feasts,
+  fable,
+  patchwork,
+  pander
+)
+
+daily_09_12 <- read_csv("2009-2012_Historical_Daily_Attendance_By_School.csv")
+daily_12_15 <- read_csv("2012_-_2015_Historical_Daily_Attendance_By_School.csv")
+daily_15_18 <- read_csv("2015-2018_Historical_Daily_Attendance_By_School.csv")
+
+# Combine data sets across years
+daily_09_15 <- rbind(daily_09_12, daily_12_15) %>% 
+  mutate(
+    date = ymd(Date)
+  )
+daily_15_18 <- daily_15_18 %>% #rbind(daily_15_18, daily_18_21)
+  mutate(
+    date = mdy(Date) # column formatted in a different order
+  )
+daily_09_18 <- rbind(daily_09_15, daily_15_18) %>% 
+  mutate(
+    ratio_attending = Present / Enrolled
+  )
+
+agg <- daily_09_18 %>% 
+  mutate(
+    yearmonth = yearmonth(date)
+  ) %>% 
+  group_by(yearmonth) %>% 
+  summarize(
+    ave_ratio_attending = mean(ratio_attending)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    index = 1:n(),
+    month = rep(factor(c(month.abb[9:12], month.abb[1:6]), levels = c(month.abb[9:12], month.abb[1:6])), n()/10)
+  ) %>% 
+  as_tsibble(index = index)
+
+gaps <- agg %>% 
+  as_tsibble(index = yearmonth) %>% 
+  fill_gaps()
+
+rects <- data.frame(
+  minx = yearmonth(sapply(2009:2018, FUN = \(yr) paste(yr, "Jun"))),
+  maxx = yearmonth(sapply(2009:2018, FUN = \(yr) paste(yr, "Sep"))),
+  miny = min(agg$ave_ratio_attending),
+  maxy = max(agg$ave_ratio_attending)
+)
+
+# Style specification
+rule_of_thumb <- list(
+  theme_bw(),
+  scale_y_continuous(labels = scales::label_percent()),
+  theme(
+    text = element_text(color = "#333333")
+  )
+)
+
+# Plot the data
+ggplot(gaps) +
+  geom_line(aes(yearmonth, ave_ratio_attending)) +
+  geom_rect(data = rects, aes(xmin = minx, xmax = maxx, ymin = miny, ymax = maxy), alpha = 0.07) +
+  labs(
+    x = "",
+    y = "Average Attendance per Enrolled",
+    title = "Monthly Attendance New York City School System",
+    subtitle = "Summer Breaks Omitted"
+  ) +
+  rule_of_thumb
+```
+
+As an overview of the analysis, the beginning explains a decomposition model, its justification, and interpretation. I then give an assessment of its goodness of fit, and explore alternative models. Finally, a forecast is given for the next two years.
+
+# Analysis
+
+## Simplifying - Cleaning the Data
+
+As clean as the data is already, it contains some challenges by nature of how a school year functions. Two in particular are 1) the frequent movement of students from one school to another or in and out of state, and 2) the occurrence of natural gaps in time.
+
+#### 1. Movement
+
+To solve the first issue, I decided to create a daily ratio of those in attendance to those enrolled per school. This removes the variability due to students enrolled at a given time. I also decided to average these values across every school in New York to get a more broad measure.
+
+#### 2. Gaps
+
+Speaking to the second issue, students do not meet on weekends and have several breaks around each holiday and in the summer. Because weeks cycle from year to year, days off do not always land on the same day of the week, and the school year does not always start on the same day of the month or year. In other words, there are a great number of days with zero attendance that are loosely random depending on your frame of reference. 
+
+To fix the frame of reference, I took the average for every month, creating an average ratio attending per month for all schools in New York.
+
+The last point to address is the summer gaps where there was not a single day of attendance in the months of July and August for any year. To perform the analysis, I closed those gaps, creating a 10 month period. After the analysis was performed, I plotted the data with summer months added back in.
+
+#### Result
+
+The change in how the data is represented is clearly shown between these plots.
+
+```{r}
+bc <- ggplot(daily_09_18, aes(date, Present)) +
+  geom_line() +
+  labs(
+    title = "Before Cleaning: Daily Attendance for Every New York City School",
+    x = ""
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(color = "#333333")
+  )
+
+mc <- daily_09_18 %>% 
+  group_by(date) %>% 
+  summarize(
+    ave_ratio_attending = mean(ratio_attending)
+  ) %>% 
+ggplot(aes(date, ave_ratio_attending)) +
+  geom_line() +
+  labs(
+    x = "",
+    y = "% Present",
+    title = "Mid Cleaning: Average Attendance Ratio Across All New York City Schools"
+  ) +
+  rule_of_thumb
+
+# Plot the data
+ac <- ggplot(gaps) +
+  geom_line(aes(yearmonth, ave_ratio_attending)) +
+  # geom_rect(data = rects, aes(xmin = minx, xmax = maxx, ymin = miny, ymax = maxy), alpha = 0.07) +
+  labs(
+    x = "",
+    y = "% Present",
+    title = "After Cleaning: Monthly Attendance Across All New York City Schools"
+  ) +
+  rule_of_thumb
+
+bc / mc / ac
+```
+
+
+## Decomposition - Pulling it Apart 
+
+To reveal trends in the data that are not already apparent, we can separate seasonal factors from the overall trend and random noise using a Holt-Winters decomposition. Those separated components are seen below
+
+::: {.panel-tabset .nav-pills}
+
+### Overview
+
+Running the Holt Winters Decomposition gives the following components. Clicking through the tabs gives a more detailed description of each.
+
+```{r}
+decomp <- agg %>% 
+  model(
+    ETS(ave_ratio_attending ~ trend("A", alpha = 0.4, beta = 0.2) + error("A") + season(period = 10, gamma = 0.01))
+  )
+
+decomp_data <- decomp %>% 
+  components %>% 
+  filter(index > 0) %>% 
+  mutate(
+    yearmonth = agg$yearmonth,
+    month = agg$month
+  )
+
+autoplot(decomp_data) +
+  rule_of_thumb
+```
+
+### Level
+
+The "level" could be called the trend. It is an attempt to remove the noise and see the general movement in the data.
+
+```{r}
+ggplot(decomp_data, aes(yearmonth, level)) +
+  geom_line() +
+  labs(
+    x = "",
+    y = "Average Attendance per Enrolled",
+    title = "Level"
+  ) +
+  rule_of_thumb
+```
+
+### Slope
+
+Slope is the trend's slope at a given moment. Visually, this plot does not tell us much more than the previous plot for level. However, it is useful for forecasting. It describes something intuitive: that if the trend is going in a direction, it is most likely to continue going in that direction (or close to it). By taking the last known level and its slope, we can add them together to make a forecast. 
+
+```{r}
+ggplot(decomp_data, aes(yearmonth, slope)) +
+  geom_line() +
+  labs(
+    x = "",
+    y = "Average Attendance per Enrolled",
+    title = "Slope"
+  ) +
+  rule_of_thumb
+```
+
+### Season
+
+Simply, this is how attendance varies by season. This is added to the level and slope for forecasting, but it also gives a visual intuition. Comparing the model to a boxplot of the original data shows clearly what this season variable represents, and it is fairly accurate in this case. 
+
+```{r}
+big_season <- ggplot(decomp_data, aes(yearmonth, season)) +
+  geom_line() +
+  labs(
+    x = "",
+    y = "Average Attendance per Enrolled",
+    title = "Seasonal Variation"
+  ) +
+  rule_of_thumb
+  
+one_season <- decomp_data %>% 
+  filter(yearmonth > yearmonth("2012-08"), yearmonth < yearmonth("2013-07")) %>% 
+  ggplot(aes(yearmonth, season)) +
+    geom_line() +
+    labs(
+      x = "",
+      y = "Average Attendance per Enrolled",
+      title = "Season - Single School Year"
+    ) +
+  rule_of_thumb
+
+box_season <- ggplot(decomp_data, aes(month, ave_ratio_attending)) +
+  geom_boxplot() +
+  # geom_line(aes(month, season)) +
+  labs(
+    x = "",
+    y = "",
+    title = "Season - Boxplot on Original Data"
+  ) +
+  rule_of_thumb
+
+big_season / (one_season + box_season)
+```
+
+### Remainder
+
+Simply state, this is what is left over. A good predictive model will show random white noise in the remainder.
+
+```{r}
+ggplot(decomp_data, aes(yearmonth, remainder)) +
+  geom_line() +
+  labs(
+    x = "",
+    y = "Average Attendance per Enrolled",
+    title = "Remainder"
+  ) +
+  rule_of_thumb
+```
+
+:::
+
+The parameters alpha $(\alpha)$, beta $(\beta)$, and gamma $(\gamma)$ are smoothing parameters. They adjust the balance between using past or most recent information more heavily in its predictions. In practice, this makes the lines either smoother or bumpier, but it also changes their shape over time.
+
+The choices of $\alpha = 0.4$, $\beta = 0.2$, and $\gamma = 0.01$ reflect an observation that seasonality is fairly consistent and not likely to change over time, and the trend has seen short term events that were important to capture as short term. In other words, $\alpha$ was adjusted to weigh heavily enough more recent data that it adjusted back quickly from large events.
+
+## Autocorrelation - Understanding Random
+
+For a good model, the residuals (or remainder) should be random white noise. One way to test this for a time series model is to use an autocorrelation (ACF) plot and a partial autocorrelation (PACF) plot. Without getting too technical, these plots check how related one point is to a previous point a certain number of time steps ago, or lags. If a certain lag has a high autocorrelation, it is closer to 1, and low is closer to 0.
+
+In understanding these plots, it helps to have context of what random isn't. Trend and season components are not random white noise, so we expect them to have patterns in their autocorrelation and partial autocorrelation plots. We look for the lines peaking past the blue dotted lines (those matter) and movement in how one line is related to the previous.
+
+```{r}
+par(mfrow=c(2,2))
+acf(decomp_data$level %>% na.omit(), main = "Trend Autocorrelation")
+pacf(decomp_data$level %>% na.omit(), main = "Trend Partial Autocorrelation")
+acf(decomp_data$season %>% na.omit(), main = "Season Autocorrelation")
+pacf(decomp_data$season %>% na.omit(), main = "Season Partial Autocorrelation")
+```
+
+The trend acf plot shows lines moving together and getting smaller over time, and its partial acf plot shows a large spike at lag 1. These are typical of a trend.
+
+For the season plots, the spikes at lag 10 tell us the current month has a very similar value to the same month last year (It is a lag of 10 instead of 12 because there are only 10 months in the school year, and the summer months were omitted).
+
+With that background, we want to ask a few questions:
+
+1. Was our decomposition a good model? If the remainder component is random, it probably did a good job
+2. If the remainder is random, can we still model it further?
+3. Is the trend identified in the decomposition meaningful?
+
+
+```{r}
+par(mfrow=c(1,2))
+acf(decomp_data$remainder %>% na.omit(), main = "Remainder Autocorrelation")
+pacf(decomp_data$remainder %>% na.omit(), main = "Remainder Partial Autocorrelation")
+```
+
+In the autocorrelation plot (ACF), there seems to be a loose wavy pattern that matches what we saw in the trend ACF. The partial autocorrelation plot (PACF) is definitely not random. This tells us the model is not an excellent one for the data.
+
+This is often a point to fit another model to the remainders, but I had a suspicion that the trend may be irrelevant. To test that theory, here is a model that is strictly seasonal. In other words, it fits a value to add or subtract each season, and that is the model.
+
+```{r}
+seasonal <- model(agg, TSLM(ave_ratio_attending ~ season(period = 10)))
+
+seasonal_data <- seasonal %>% 
+  augment() %>% 
+  left_join(agg, by = "index") 
+
+ggplot(seasonal_data, aes(yearmonth, .resid)) +
+  geom_line() +
+  rule_of_thumb
+
+l <- seasonal %>% residuals() %>% ACF() %>% autoplot() + rule_of_thumb
+r <- seasonal %>% residuals() %>% PACF() %>% autoplot() + rule_of_thumb
+l + r
+```
+
+These plots look far more random. We could reasonably stop here, but for completeness I will fit another model to address the autocorrelation at lag 1. An AR model models the effects of autocorrelation, in this case for just 1 lag.
+
+```{r}
+# AR(1) model
+ar1 <- model(seasonal_data, AR(.resid ~ order(1))) %>% select(!.model)
+
+# table
+ar1 %>% tidy() %>% select(!.model) %>% pander()
+
+# plots
+l <- ar1 %>% residuals() %>% ACF() %>% autoplot() + rule_of_thumb
+r <- ar1 %>% residuals() %>% PACF() %>% autoplot() + rule_of_thumb
+l + r
+```
+
+These plots look sufficiently random and have no peaks above the blue confidence lines. However, the model is barely significant with a P-value of 0.045. For sake of simplicity, it may be best to keep the seasonal only model.
+
+# Forecast
+
+It is hard to tell if the tail off or down turn we saw in earlier plots is part of a broader trend or if it is simply random variation. It seems most likely that the attendance level will return to a stable rate, though it is not hard to imagine that there may be a reason students are attending school less in general. One reason to give pause to this idea is that start of the year attendance has still returned to a normal high level and the more recent lows are still within the confidence level of the stationary model.
+
+```{r}
+rects <- data.frame(
+  minx = yearmonth(sapply(2009:2019, FUN = \(yr) paste(yr, "Jun"))),
+  maxx = yearmonth(sapply(2009:2019, FUN = \(yr) paste(yr, "Sep"))),
+  miny = 1,#min(agg$ave_ratio_attending),
+  maxy = 0#max(agg$ave_ratio_attending)
+)
+
+forecast(seasonal, new_data(agg, 20)) %>% 
+  mutate(
+    yearmonth = yearmonth(
+      c(seq(ymd("2018-09-01"), ymd("2019-06-01"), by = "month"), 
+        seq(ymd("2019-09-01"), ymd("2020-06-01"), by = "month"))
+    )
+  ) %>% 
+  update_tsibble(index = yearmonth) %>% 
+  fill_gaps() %>% 
+  as_fable(
+    response = "ave_ratio_attending", 
+    distribution = ave_ratio_attending
+  ) %>%
+  autoplot(gaps) +
+  geom_rect(data = rects, aes(xmin = minx, xmax = maxx, ymin = miny, ymax = maxy), alpha = 0.07, inherit.aes = FALSE) +
+  labs(
+    x = "",
+    y = "% Students Present",
+    title = "Monthly Grade School Attendance Forecast - New York City School System",
+    subtitle = "Summer Breaks Omitted",
+    caption = "New York City daily school attendance data was retrieved from data.gov\nhttps://catalog.data.gov/dataset/2009-2012-historical-daily-attendance-by-school\nhttps://catalog.data.gov/dataset/2012-2015-historical-daily-attendance-by-school\nhttps://catalog.data.gov/dataset/2015-2018-historical-daily-attendance-by-school"
+  ) +
+  rule_of_thumb +
+  theme(
+    legend.position = "none"
+  ) +
+  # scale_x_yearmonth(breaks = seq(as.Date("2009-09-01"), as.Date("2020-09-01"), "2 year"))
+  scale_x_yearmonth(date_breaks = "2 year", labels = \(x) paste0(year(x)-1, "\n", year(x))) +
+  scale_y_continuous(breaks = c(0.82, 0.87, 0.92), labels = scales::label_percent()) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  coord_cartesian(ylim = c(0.81, 0.94))
+```
+
+
+### Data Attributions
+
+New York City daily school attendance data was retrieved from data.gov. Three datasets were aggregated to obtain attendance from 2009-2018 (2009-2012, 2012-2015, 2015-2018).
+
+https://catalog.data.gov/dataset?q=daily+attendance&sort=views_recent+desc&publisher=data.cityofnewyork.us&ext_location=&ext_bbox=&ext_prev_extent=
